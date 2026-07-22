@@ -26,6 +26,123 @@ use std::hash::{Hash, Hasher};
 
 use super::static_filter::StaticFilter;
 
+const MAX_INT32_BITMAP_BITS: usize = 1 << 20;
+// A bitmap uses one bit for every value in the span. Keep its size within
+// roughly 16 bytes per list entry, which is comparable to the storage needed
+// by the hash table while avoiding a hash lookup for every input row.
+const INT32_BITMAP_BITS_PER_VALUE: usize = 128;
+
+enum Int32FilterStorage {
+    Bitmap { min: i32, bits: Vec<u64> },
+    Hash(HashSet<i32>),
+}
+
+pub(super) struct Int32StaticFilter {
+    null_count: usize,
+    storage: Int32FilterStorage,
+}
+
+impl Int32StaticFilter {
+    pub(super) fn try_new(in_array: &ArrayRef) -> Result<Self> {
+        let in_array = in_array.as_primitive_opt::<Int32Type>().ok_or_else(|| {
+            exec_datafusion_err!("Failed to downcast an array to an 'Int32Type' array")
+        })?;
+        let null_count = in_array.null_count();
+        let values = in_array.iter().flatten().collect::<Vec<_>>();
+
+        let storage = match (values.iter().copied().min(), values.iter().copied().max()) {
+            (Some(min), Some(max)) => {
+                let span = (i64::from(max) - i64::from(min) + 1) as usize;
+                let relative_limit = values
+                    .len()
+                    .saturating_mul(INT32_BITMAP_BITS_PER_VALUE)
+                    .max(256);
+                if span <= MAX_INT32_BITMAP_BITS && span <= relative_limit {
+                    let mut bits = vec![0_u64; span.div_ceil(64)];
+                    for value in values {
+                        let index = (i64::from(value) - i64::from(min)) as usize;
+                        bits[index / 64] |= 1_u64 << (index % 64);
+                    }
+                    Int32FilterStorage::Bitmap { min, bits }
+                } else {
+                    Int32FilterStorage::Hash(values.into_iter().collect())
+                }
+            }
+            _ => Int32FilterStorage::Hash(HashSet::new()),
+        };
+
+        Ok(Self {
+            null_count,
+            storage,
+        })
+    }
+
+    #[inline(always)]
+    fn contains_value(&self, value: i32) -> bool {
+        match &self.storage {
+            Int32FilterStorage::Bitmap { min, bits } => {
+                let index = i64::from(value) - i64::from(*min);
+                if index < 0 {
+                    return false;
+                }
+                let index = index as usize;
+                bits.get(index / 64)
+                    .is_some_and(|word| word & (1_u64 << (index % 64)) != 0)
+            }
+            Int32FilterStorage::Hash(values) => values.contains(&value),
+        }
+    }
+}
+
+impl StaticFilter for Int32StaticFilter {
+    fn null_count(&self) -> usize {
+        self.null_count
+    }
+
+    fn contains(&self, v: &dyn Array, negated: bool) -> Result<BooleanArray> {
+        downcast_dictionary_array! {
+            v => {
+                let values_contains = self.contains(v.values().as_ref(), negated)?;
+                let result = take(&values_contains, v.keys(), None)?;
+                return Ok(downcast_array(result.as_ref()))
+            }
+            _ => {}
+        }
+
+        let v = v.as_primitive_opt::<Int32Type>().ok_or_else(|| {
+            exec_datafusion_err!("Failed to downcast an array to an 'Int32Type' array")
+        })?;
+        let needle_values = v.values();
+        let contains_buffer = BooleanBuffer::collect_bool(needle_values.len(), |i| {
+            self.contains_value(needle_values[i]) != negated
+        });
+
+        let result_nulls = match (v.null_count() > 0, self.null_count > 0) {
+            (false, false) => None,
+            (true, false) => v.nulls().cloned(),
+            (false, true) => Some(NullBuffer::new(if negated {
+                !&contains_buffer
+            } else {
+                contains_buffer.clone()
+            })),
+            (true, true) => {
+                let needle_validity = v
+                    .nulls()
+                    .map(|nulls| nulls.inner().clone())
+                    .unwrap_or_else(|| BooleanBuffer::new_set(needle_values.len()));
+                let haystack_validity = if negated {
+                    !&contains_buffer
+                } else {
+                    contains_buffer.clone()
+                };
+                Some(NullBuffer::new(&needle_validity & &haystack_validity))
+            }
+        };
+
+        Ok(BooleanArray::new(contains_buffer, result_nulls))
+    }
+}
+
 /// Wrapper for f32 that implements Hash and Eq using bit comparison.
 /// This treats NaN values as equal to each other when they have the same bit pattern.
 #[derive(Clone, Copy)]
@@ -213,7 +330,6 @@ macro_rules! primitive_static_filter {
 // Generate specialized filters for all integer primitive types
 primitive_static_filter!(Int8StaticFilter, Int8Type);
 primitive_static_filter!(Int16StaticFilter, Int16Type);
-primitive_static_filter!(Int32StaticFilter, Int32Type);
 primitive_static_filter!(Int64StaticFilter, Int64Type);
 primitive_static_filter!(UInt8StaticFilter, UInt8Type);
 primitive_static_filter!(UInt16StaticFilter, UInt16Type);
@@ -231,3 +347,32 @@ macro_rules! float_static_filter {
 // Generate specialized filters for float types using ordered wrappers
 float_static_filter!(Float32StaticFilter, Float32Type, OrderedFloat32);
 float_static_filter!(Float64StaticFilter, Float64Type, OrderedFloat64);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::Int32Array;
+    use std::sync::Arc;
+
+    #[test]
+    fn int32_filter_uses_bitmap_within_memory_budget() -> Result<()> {
+        let values = (0..1_000).map(|value| value * 101).collect::<Vec<_>>();
+        let values: ArrayRef = Arc::new(Int32Array::from(values));
+
+        let filter = Int32StaticFilter::try_new(&values)?;
+
+        assert!(matches!(filter.storage, Int32FilterStorage::Bitmap { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn int32_filter_uses_hash_beyond_memory_budget() -> Result<()> {
+        let values = (0..1_000).map(|value| value * 129).collect::<Vec<_>>();
+        let values: ArrayRef = Arc::new(Int32Array::from(values));
+
+        let filter = Int32StaticFilter::try_new(&values)?;
+
+        assert!(matches!(filter.storage, Int32FilterStorage::Hash(_)));
+        Ok(())
+    }
+}
