@@ -36,6 +36,65 @@ use parquet::arrow::arrow_reader::statistics::StatisticsConverter;
 use parquet::file::metadata::RowGroupMetaData;
 use parquet::schema::types::SchemaDescriptor;
 
+/// Returns true when row-group statistics prove that every row in the file
+/// satisfies `expr`.
+///
+/// This proof is conservative: nullable columns require a known zero null
+/// count, and missing or unsupported statistics return false.
+pub(crate) fn predicate_matches_all_row_groups(
+    expr: Arc<dyn PhysicalExpr>,
+    arrow_schema: &Schema,
+    parquet_schema: &SchemaDescriptor,
+    groups: &[RowGroupMetaData],
+) -> bool {
+    if groups.is_empty() {
+        return false;
+    }
+
+    let Ok(predicate) = PruningPredicate::try_new(expr, Arc::new(arrow_schema.clone()))
+    else {
+        return false;
+    };
+    let mut inverted_expr: Arc<dyn PhysicalExpr> =
+        Arc::new(NotExpr::new(Arc::clone(predicate.orig_expr())));
+    let mut columns = collect_columns(predicate.orig_expr())
+        .into_iter()
+        .filter(|column| arrow_schema.field(column.index()).is_nullable())
+        .collect::<Vec<_>>();
+    columns.sort_by(|a, b| {
+        a.index()
+            .cmp(&b.index())
+            .then_with(|| a.name().cmp(b.name()))
+    });
+    for column in columns {
+        inverted_expr = Arc::new(BinaryExpr::new(
+            inverted_expr,
+            Operator::Or,
+            Arc::new(IsNullExpr::new(Arc::new(column))),
+        ));
+    }
+
+    let simplifier = PhysicalExprSimplifier::new(arrow_schema);
+    let Ok(inverted_expr) = simplifier.simplify(inverted_expr) else {
+        return false;
+    };
+    let Ok(inverted_predicate) =
+        PruningPredicate::try_new(inverted_expr, Arc::clone(predicate.schema()))
+    else {
+        return false;
+    };
+    let stats = RowGroupPruningStatistics {
+        parquet_schema,
+        row_group_metadatas: groups.iter().collect(),
+        arrow_schema,
+        missing_null_counts_as_zero: false,
+    };
+
+    inverted_predicate
+        .prune(&stats)
+        .is_ok_and(|values| values.into_iter().all(|value| !value))
+}
+
 /// Reduces the [`ParquetAccessPlan`] based on row group level metadata.
 ///
 /// This struct implements the various types of pruning that are applied to a
@@ -640,6 +699,59 @@ mod tests {
             &metrics,
         );
         assert_pruned(row_groups, ExpectedPruning::Some(vec![1]))
+    }
+
+    #[test]
+    fn detects_predicate_satisfied_by_every_row_group() {
+        use datafusion_expr::{col, lit};
+
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("c1", DataType::Int32, false)]));
+        let field = PrimitiveTypeField::new("c1", PhysicalType::INT32);
+        let schema_descr = get_test_schema_descr(vec![field]);
+        let row_groups = vec![
+            get_row_group_meta_data(
+                &schema_descr,
+                vec![ParquetStatistics::int32(
+                    Some(1),
+                    Some(50),
+                    None,
+                    Some(0),
+                    false,
+                )],
+            ),
+            get_row_group_meta_data(
+                &schema_descr,
+                vec![ParquetStatistics::int32(
+                    Some(51),
+                    Some(102),
+                    None,
+                    Some(0),
+                    false,
+                )],
+            ),
+        ];
+        let full_range = logical2physical(
+            &col("c1").gt_eq(lit(1)).and(col("c1").lt_eq(lit(102))),
+            &schema,
+        );
+        let partial_range = logical2physical(
+            &col("c1").gt_eq(lit(5)).and(col("c1").lt_eq(lit(10))),
+            &schema,
+        );
+
+        assert!(predicate_matches_all_row_groups(
+            full_range,
+            &schema,
+            &schema_descr,
+            &row_groups,
+        ));
+        assert!(!predicate_matches_all_row_groups(
+            partial_range,
+            &schema,
+            &schema_descr,
+            &row_groups,
+        ));
     }
 
     #[test]

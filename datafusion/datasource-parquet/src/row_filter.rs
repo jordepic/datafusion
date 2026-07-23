@@ -91,6 +91,7 @@ use datafusion_physical_expr::{PhysicalExpr, split_conjunction};
 use datafusion_physical_plan::metrics;
 
 use super::ParquetFileMetrics;
+use super::row_group_filter::predicate_matches_all_row_groups;
 use super::supported_predicates::supports_list_predicates;
 
 /// A "compiled" predicate passed to `ParquetRecordBatchStream` to perform
@@ -1027,7 +1028,14 @@ pub fn build_row_filter(
 
     // Split into conjuncts:
     // `a = 1 AND b = 2 AND c = 3` -> [`a = 1`, `b = 2`, `c = 3`]
-    let predicates = split_conjunction(expr);
+    let predicates = split_conjunction(expr).into_iter().filter(|expr| {
+        !predicate_matches_all_row_groups(
+            Arc::clone(expr),
+            file_schema,
+            metadata.file_metadata().schema_descr(),
+            metadata.row_groups(),
+        )
+    });
 
     // Determine which conjuncts can be evaluated as ArrowPredicates, if any
     let mut candidates: Vec<FilterCandidate> = predicates
