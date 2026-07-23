@@ -74,6 +74,7 @@ use arrow::error::{ArrowError, Result as ArrowResult};
 use arrow::record_batch::RecordBatch;
 use datafusion_functions::core::getfield::GetFieldFunc;
 use parquet::arrow::ProjectionMask;
+use parquet::arrow::arrow_reader::statistics::StatisticsConverter;
 use parquet::arrow::arrow_reader::{ArrowPredicate, RowFilter};
 use parquet::file::metadata::ParquetMetaData;
 use parquet::schema::types::SchemaDescriptor;
@@ -249,6 +250,8 @@ impl FilterCandidateBuilder {
                 |(read_plan, required_bytes)| FilterCandidate {
                     estimated_selectivity: estimate_dynamic_in_list_selectivity(
                         &self.expr,
+                        &self.file_schema,
+                        metadata,
                     ),
                     expr: self.expr,
                     required_bytes,
@@ -259,43 +262,80 @@ impl FilterCandidateBuilder {
     }
 }
 
-/// Estimate the selectivity of a completed dynamic integer `IN` filter from
-/// the density of its values. Join runtime filters commonly contain an exact
-/// `IN` list plus redundant min/max bounds, so `distinct values / value span`
-/// is a useful estimate without reading any data or relying on table statistics.
-fn estimate_dynamic_in_list_selectivity(expr: &Arc<dyn PhysicalExpr>) -> Option<f64> {
+/// Estimate the selectivity of a completed dynamic integer `IN` filter against
+/// the file's value domain. Join runtime filters commonly contain an exact
+/// `IN` list plus redundant min/max bounds, while Parquet row-group statistics
+/// provide a conservative domain without reading column data.
+fn estimate_dynamic_in_list_selectivity(
+    expr: &Arc<dyn PhysicalExpr>,
+    file_schema: &Schema,
+    metadata: &ParquetMetaData,
+) -> Option<f64> {
     let dynamic = expr.downcast_ref::<DynamicFilterPhysicalExpr>()?;
     let current = dynamic.current().ok()?;
-    let mut estimate = None;
-    find_integer_in_list_selectivity(&current, &mut estimate)?;
-    estimate
+    let mut values = None;
+    find_integer_in_list_values(&current, &mut values)?;
+    let values = values?;
+
+    let columns = collect_columns(&current);
+    if columns.len() != 1 {
+        return None;
+    }
+    let column = columns.into_iter().next()?;
+    let converter = StatisticsConverter::try_new(
+        column.name(),
+        file_schema,
+        metadata.file_metadata().schema_descr(),
+    )
+    .ok()?;
+    let row_groups = metadata.row_groups().iter();
+    let mins = converter.row_group_mins(row_groups.clone()).ok()?;
+    let maxes = converter.row_group_maxes(row_groups).ok()?;
+
+    let domain_min = (0..mins.len())
+        .filter_map(|index| ScalarValue::try_from_array(&mins, index).ok())
+        .filter_map(|value| integer_scalar_value(&value))
+        .min()?;
+    let domain_max = (0..maxes.len())
+        .filter_map(|index| ScalarValue::try_from_array(&maxes, index).ok())
+        .filter_map(|value| integer_scalar_value(&value))
+        .max()?;
+    estimate_integer_in_list_selectivity(&values, domain_min, domain_max)
 }
 
-fn find_integer_in_list_selectivity(
+fn find_integer_in_list_values(
     expr: &Arc<dyn PhysicalExpr>,
-    estimate: &mut Option<f64>,
+    values: &mut Option<BTreeSet<i128>>,
 ) -> Option<()> {
     if let Some(in_list) = expr.downcast_ref::<InListExpr>() {
-        if in_list.negated() || estimate.is_some() {
+        if in_list.negated() || values.is_some() {
             return None;
         }
 
-        let mut values = BTreeSet::new();
+        let mut in_values = BTreeSet::new();
         for item in in_list.list() {
             let literal = item.downcast_ref::<Literal>()?;
-            values.insert(integer_scalar_value(literal.value())?);
+            in_values.insert(integer_scalar_value(literal.value())?);
         }
-        let min = *values.first()?;
-        let max = *values.last()?;
-        let span = max.checked_sub(min)?.checked_add(1)?;
-        let selectivity = values.len() as f64 / span as f64;
-        *estimate = Some(selectivity.min(1.0));
+        *values = Some(in_values);
     }
 
     for child in expr.children() {
-        find_integer_in_list_selectivity(child, estimate)?;
+        find_integer_in_list_values(child, values)?;
     }
     Some(())
+}
+
+fn estimate_integer_in_list_selectivity(
+    values: &BTreeSet<i128>,
+    domain_min: i128,
+    domain_max: i128,
+) -> Option<f64> {
+    let domain_span = domain_max.checked_sub(domain_min)?.checked_add(1)?;
+    if domain_span <= 0 {
+        return None;
+    }
+    Some((values.len() as f64 / domain_span as f64).min(1.0))
 }
 
 fn integer_scalar_value(value: &ScalarValue) -> Option<i128> {
@@ -1326,22 +1366,40 @@ mod test {
         let dynamic = Arc::new(DynamicFilterPhysicalExpr::new(vec![column], inner))
             as Arc<dyn PhysicalExpr>;
 
-        assert_eq!(estimate_dynamic_in_list_selectivity(&dynamic), Some(0.3));
+        let current = dynamic
+            .downcast_ref::<DynamicFilterPhysicalExpr>()
+            .unwrap()
+            .current()
+            .unwrap();
+        let mut values = None;
+        find_integer_in_list_values(&current, &mut values).unwrap();
+        assert_eq!(
+            estimate_integer_in_list_selectivity(&values.unwrap(), 0, 29),
+            Some(0.1)
+        );
     }
 
     #[test]
-    fn does_not_estimate_static_or_negated_in_lists() {
+    fn extracts_static_and_rejects_negated_in_lists() {
         let schema = Schema::new(vec![Field::new("a", DataType::Int32, true)]);
         let column = Arc::new(PhysicalColumn::new("a", 0)) as Arc<dyn PhysicalExpr>;
         let list = vec![lit(10_i32), lit(11_i32)];
         let static_list =
             in_list(Arc::clone(&column), list.clone(), &false, &schema).unwrap();
-        assert_eq!(estimate_dynamic_in_list_selectivity(&static_list), None);
+        let mut values = None;
+        assert!(find_integer_in_list_values(&static_list, &mut values).is_some());
+        assert_eq!(values.unwrap().len(), 2);
 
         let negated = in_list(Arc::clone(&column), list, &true, &schema).unwrap();
         let dynamic = Arc::new(DynamicFilterPhysicalExpr::new(vec![column], negated))
             as Arc<dyn PhysicalExpr>;
-        assert_eq!(estimate_dynamic_in_list_selectivity(&dynamic), None);
+        let current = dynamic
+            .downcast_ref::<DynamicFilterPhysicalExpr>()
+            .unwrap()
+            .current()
+            .unwrap();
+        let mut values = None;
+        assert!(find_integer_in_list_values(&current, &mut values).is_none());
     }
 
     // List predicates used by the decoder should be accepted for pushdown
