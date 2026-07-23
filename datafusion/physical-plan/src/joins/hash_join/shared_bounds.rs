@@ -135,6 +135,9 @@ fn create_membership_predicate(
             hash_map,
             "hash_lookup".to_string(),
         )) as Arc<dyn PhysicalExpr>)),
+        // The build-side keys cover every value between their minimum and maximum,
+        // so the bounds predicate is also an exact membership predicate.
+        PushdownStrategy::BoundsOnly => Ok(None),
         // Empty partition - should not create a filter for this
         PushdownStrategy::Empty => Ok(None),
     }
@@ -264,6 +267,8 @@ pub(crate) enum PushdownStrategy {
     InList(ArrayRef),
     /// Use map lookup for large build sides
     Map(Arc<Map>),
+    /// Use only the exact min/max bounds for a dense integral build-side key set.
+    BoundsOnly,
     /// There was no data in this partition, do not build a dynamic filter for it
     Empty,
 }

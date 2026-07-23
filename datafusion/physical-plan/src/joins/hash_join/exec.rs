@@ -74,8 +74,8 @@ use arrow_schema::{DataType, Schema};
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::utils::memory::estimate_memory_size;
 use datafusion_common::{
-    JoinSide, JoinType, NullEquality, Result, assert_or_internal_err, internal_err,
-    plan_err, project_schema,
+    JoinSide, JoinType, NullEquality, Result, ScalarValue, assert_or_internal_err,
+    internal_err, plan_err, project_schema,
 };
 use datafusion_execution::TaskContext;
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
@@ -1849,6 +1849,53 @@ fn should_collect_min_max_for_perfect_hash(
     Ok(ArrayMap::is_supported_type(&data_type))
 }
 
+/// Returns true when a single integral join key contains every value in its
+/// observed min/max range. In that case the bounds predicate is an exact
+/// membership predicate and an additional IN-list or hash lookup is redundant.
+fn bounds_are_exact_membership(
+    on_left: &[PhysicalExprRef],
+    bounds: Option<&PartitionBounds>,
+    distinct_keys: usize,
+) -> bool {
+    if on_left.len() != 1 || distinct_keys == 0 {
+        return false;
+    }
+
+    let Some(bounds) = bounds.and_then(|bounds| bounds.get_column_bounds(0)) else {
+        return false;
+    };
+
+    fn integral_value(value: &ScalarValue) -> Option<i128> {
+        match value {
+            ScalarValue::Int8(Some(value)) => Some((*value).into()),
+            ScalarValue::Int16(Some(value)) => Some((*value).into()),
+            ScalarValue::Int32(Some(value)) | ScalarValue::Date32(Some(value)) => {
+                Some((*value).into())
+            }
+            ScalarValue::Int64(Some(value)) | ScalarValue::Date64(Some(value)) => {
+                Some((*value).into())
+            }
+            ScalarValue::UInt8(Some(value)) => Some((*value).into()),
+            ScalarValue::UInt16(Some(value)) => Some((*value).into()),
+            ScalarValue::UInt32(Some(value)) => Some((*value).into()),
+            ScalarValue::UInt64(Some(value)) => Some((*value).into()),
+            _ => None,
+        }
+    }
+
+    let Some(min) = integral_value(&bounds.min) else {
+        return false;
+    };
+    let Some(max) = integral_value(&bounds.max) else {
+        return false;
+    };
+
+    max.checked_sub(min)
+        .and_then(|width| width.checked_add(1))
+        .and_then(|width| usize::try_from(width).ok())
+        == Some(distinct_keys)
+}
+
 /// Collects all batches from the left (build) side stream and creates a hash map for joining.
 ///
 /// This function is responsible for:
@@ -2033,8 +2080,11 @@ async fn collect_left_input(
 
     let map = Arc::new(join_hash_map);
 
+    let distinct_keys = map.num_of_distinct_key();
     let membership = if num_rows == 0 {
         PushdownStrategy::Empty
+    } else if bounds_are_exact_membership(&on_left, bounds.as_ref(), distinct_keys) {
+        PushdownStrategy::BoundsOnly
     } else {
         // If the build side is small enough we can use IN list pushdown.
         // If it's too big we fall back to pushing down a reference to the hash table.
@@ -2046,7 +2096,7 @@ async fn collect_left_input(
         if left_values.is_empty()
             || left_values[0].is_empty()
             || estimated_size > config.optimizer.hash_join_inlist_pushdown_max_size
-            || map.num_of_distinct_key()
+            || distinct_keys
                 > config
                     .optimizer
                     .hash_join_inlist_pushdown_max_distinct_values
@@ -2082,6 +2132,41 @@ async fn collect_left_input(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dense_integral_bounds_are_exact_membership() {
+        let key = Arc::new(Column::new("key", 0)) as PhysicalExprRef;
+        let bounds = PartitionBounds::new(vec![ColumnBounds::new(
+            ScalarValue::Int32(Some(1)),
+            ScalarValue::Int32(Some(102)),
+        )]);
+
+        assert!(bounds_are_exact_membership(&[key], Some(&bounds), 102));
+    }
+
+    #[test]
+    fn sparse_or_non_integral_bounds_are_not_exact_membership() {
+        let key = Arc::new(Column::new("key", 0)) as PhysicalExprRef;
+        let sparse_bounds = PartitionBounds::new(vec![ColumnBounds::new(
+            ScalarValue::Int32(Some(1)),
+            ScalarValue::Int32(Some(102)),
+        )]);
+        let string_bounds = PartitionBounds::new(vec![ColumnBounds::new(
+            ScalarValue::Utf8(Some("a".to_string())),
+            ScalarValue::Utf8(Some("c".to_string())),
+        )]);
+
+        assert!(!bounds_are_exact_membership(
+            std::slice::from_ref(&key),
+            Some(&sparse_bounds),
+            101,
+        ));
+        assert!(!bounds_are_exact_membership(
+            &[key],
+            Some(&string_bounds),
+            3,
+        ));
+    }
 
     fn assert_phj_used(metrics: &MetricsSet, use_phj: bool) {
         if use_phj {
