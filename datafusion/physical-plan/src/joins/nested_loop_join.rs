@@ -49,7 +49,7 @@ use crate::{
 };
 
 use arrow::array::{
-    Array, BooleanArray, BooleanBufferBuilder, RecordBatchOptions, UInt32Array,
+    Array, ArrayRef, BooleanArray, BooleanBufferBuilder, RecordBatchOptions, UInt32Array,
     UInt64Array, new_null_array,
 };
 use arrow::buffer::BooleanBuffer;
@@ -2245,8 +2245,9 @@ impl NestedLoopJoinStream {
             return Ok(None);
         }
 
-        // Build the projected output batch (using output schema/column_indices),
-        // then apply the bitmap filter to it.
+        // Filter the Cartesian-product indices before materializing the projected
+        // output columns. In selective joins this avoids constructing every
+        // candidate value only to discard most of them immediately afterward.
         if self.output_schema.fields().is_empty() {
             // Empty projection: only row count matters
             let row_count = bitmap_combined.true_count();
@@ -2256,22 +2257,32 @@ impl NestedLoopJoinStream {
             )?));
         }
 
+        let (left_output_indices, right_output_indices): (ArrayRef, ArrayRef) =
+            if bitmap_combined.true_count() == total_rows {
+                (Arc::new(left_indices), Arc::new(right_indices))
+            } else {
+                (
+                    filter(&left_indices, &bitmap_combined)?,
+                    filter(&right_indices, &bitmap_combined)?,
+                )
+            };
+
         let mut out_columns: Vec<Arc<dyn Array>> =
             Vec::with_capacity(self.output_schema.fields().len());
         for column_index in &self.column_indices {
             let array = if column_index.side == JoinSide::Left {
                 let col = left_data.batch().column(column_index.index);
-                take(col.as_ref(), &left_indices, None)?
+                take(col.as_ref(), left_output_indices.as_ref(), None)?
             } else {
                 let col = right_batch.column(column_index.index);
-                take(col.as_ref(), &right_indices, None)?
+                take(col.as_ref(), right_output_indices.as_ref(), None)?
             };
             out_columns.push(array);
         }
-        let pre_filtered =
-            RecordBatch::try_new(Arc::clone(&self.output_schema), out_columns)?;
-        let filtered = filter_record_batch(&pre_filtered, &bitmap_combined)?;
-        Ok(Some(filtered))
+        Ok(Some(RecordBatch::try_new(
+            Arc::clone(&self.output_schema),
+            out_columns,
+        )?))
     }
 
     /// Process a single left row join with the current right batch.
