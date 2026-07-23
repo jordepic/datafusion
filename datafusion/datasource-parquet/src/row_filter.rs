@@ -91,7 +91,9 @@ use datafusion_physical_expr::{PhysicalExpr, split_conjunction};
 use datafusion_physical_plan::metrics;
 
 use super::ParquetFileMetrics;
-use super::row_group_filter::predicate_matches_all_row_groups;
+use super::row_group_filter::{
+    dynamic_predicate_matches_all_non_null_row_groups, predicate_matches_all_row_groups,
+};
 use super::supported_predicates::supports_list_predicates;
 
 /// A "compiled" predicate passed to `ParquetRecordBatchStream` to perform
@@ -1031,6 +1033,11 @@ pub fn build_row_filter(
     let predicates = split_conjunction(expr).into_iter().filter(|expr| {
         !predicate_matches_all_row_groups(
             Arc::clone(expr),
+            file_schema,
+            metadata.file_metadata().schema_descr(),
+            metadata.row_groups(),
+        ) && !dynamic_predicate_matches_all_non_null_row_groups(
+            expr,
             file_schema,
             metadata.file_metadata().schema_descr(),
             metadata.row_groups(),

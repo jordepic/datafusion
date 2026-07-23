@@ -28,7 +28,9 @@ use datafusion_common::pruning::PruningStatistics;
 use datafusion_common::{Column, Result, ScalarValue};
 use datafusion_datasource::FileRange;
 use datafusion_expr::Operator;
-use datafusion_physical_expr::expressions::{BinaryExpr, IsNullExpr, NotExpr};
+use datafusion_physical_expr::expressions::{
+    BinaryExpr, DynamicFilterPhysicalExpr, IsNotNullExpr, IsNullExpr, NotExpr,
+};
 use datafusion_physical_expr::utils::collect_columns;
 use datafusion_physical_expr::{PhysicalExpr, PhysicalExprSimplifier};
 use datafusion_pruning::PruningPredicate;
@@ -80,6 +82,60 @@ pub(crate) fn predicate_matches_all_row_groups(
     };
     let Ok(inverted_predicate) =
         PruningPredicate::try_new(inverted_expr, Arc::clone(predicate.schema()))
+    else {
+        return false;
+    };
+    let stats = RowGroupPruningStatistics {
+        parquet_schema,
+        row_group_metadatas: groups.iter().collect(),
+        arrow_schema,
+        missing_null_counts_as_zero: false,
+    };
+
+    inverted_predicate
+        .prune(&stats)
+        .is_ok_and(|values| values.into_iter().all(|value| !value))
+}
+
+/// Returns true when an optional dynamic filter cannot reject any non-null
+/// value according to row-group statistics.
+///
+/// Dynamic filters are redundant correctness filters owned by another
+/// operator, such as a hash join. If the only rows they can reject early are
+/// nulls, the owning operator will reject those rows and the Parquet decoder
+/// can avoid reading the filter column.
+pub(crate) fn dynamic_predicate_matches_all_non_null_row_groups(
+    expr: &Arc<dyn PhysicalExpr>,
+    arrow_schema: &Schema,
+    parquet_schema: &SchemaDescriptor,
+    groups: &[RowGroupMetaData],
+) -> bool {
+    if groups.is_empty() || expr.downcast_ref::<DynamicFilterPhysicalExpr>().is_none() {
+        return false;
+    }
+
+    let Ok(predicate) =
+        PruningPredicate::try_new(Arc::clone(expr), Arc::new(arrow_schema.clone()))
+    else {
+        return false;
+    };
+    let columns = collect_columns(predicate.orig_expr());
+    if columns.len() != 1 {
+        return false;
+    }
+    let column = columns.into_iter().next().expect("one column");
+
+    let inverted_non_null = Arc::new(BinaryExpr::new(
+        Arc::new(NotExpr::new(Arc::clone(predicate.orig_expr()))),
+        Operator::And,
+        Arc::new(IsNotNullExpr::new(Arc::new(column))),
+    ));
+    let simplifier = PhysicalExprSimplifier::new(arrow_schema);
+    let Ok(inverted_non_null) = simplifier.simplify(inverted_non_null) else {
+        return false;
+    };
+    let Ok(inverted_predicate) =
+        PruningPredicate::try_new(inverted_non_null, Arc::clone(predicate.schema()))
     else {
         return false;
     };
@@ -748,6 +804,54 @@ mod tests {
         ));
         assert!(!predicate_matches_all_row_groups(
             partial_range,
+            &schema,
+            &schema_descr,
+            &row_groups,
+        ));
+    }
+
+    #[test]
+    fn detects_dynamic_predicate_satisfied_by_every_non_null_value() {
+        use datafusion_physical_expr::expressions::{Column as PhysicalColumn, lit};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("c1", DataType::Int32, true)]));
+        let field = PrimitiveTypeField::new("c1", PhysicalType::INT32);
+        let schema_descr = get_test_schema_descr(vec![field]);
+        let row_groups = vec![get_row_group_meta_data(
+            &schema_descr,
+            vec![ParquetStatistics::int32(
+                Some(1),
+                Some(100),
+                None,
+                Some(10),
+                false,
+            )],
+        )];
+        let column = Arc::new(PhysicalColumn::new("c1", 0)) as Arc<dyn PhysicalExpr>;
+        let bounds = Arc::new(BinaryExpr::new(
+            Arc::new(BinaryExpr::new(
+                Arc::clone(&column),
+                Operator::GtEq,
+                lit(ScalarValue::Int32(Some(1))),
+            )),
+            Operator::And,
+            Arc::new(BinaryExpr::new(
+                Arc::clone(&column),
+                Operator::LtEq,
+                lit(ScalarValue::Int32(Some(102))),
+            )),
+        )) as Arc<dyn PhysicalExpr>;
+        let dynamic = Arc::new(DynamicFilterPhysicalExpr::new(vec![column], bounds))
+            as Arc<dyn PhysicalExpr>;
+
+        assert!(dynamic_predicate_matches_all_non_null_row_groups(
+            &dynamic,
+            &schema,
+            &schema_descr,
+            &row_groups,
+        ));
+        assert!(!predicate_matches_all_row_groups(
+            dynamic,
             &schema,
             &schema_descr,
             &row_groups,
