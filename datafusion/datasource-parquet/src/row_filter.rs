@@ -82,9 +82,7 @@ use datafusion_common::Result;
 use datafusion_common::cast::as_boolean_array;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor};
 use datafusion_physical_expr::ScalarFunctionExpr;
-use datafusion_physical_expr::expressions::{
-    Column, DynamicFilterPhysicalExpr, Literal,
-};
+use datafusion_physical_expr::expressions::{Column, DynamicFilterPhysicalExpr, Literal};
 use datafusion_physical_expr::utils::{
     collect_columns, conjunction, reassign_expr_columns,
 };
@@ -1030,7 +1028,6 @@ pub fn build_row_filter(
     // Split into conjuncts:
     // `a = 1 AND b = 2 AND c = 3` -> [`a = 1`, `b = 2`, `c = 3`]
     let dynamic_snapshot = expr
-        .as_any()
         .downcast_ref::<DynamicFilterPhysicalExpr>()
         .map(DynamicFilterPhysicalExpr::current)
         .transpose()?;
