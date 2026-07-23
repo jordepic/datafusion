@@ -1094,13 +1094,12 @@ pub fn build_row_filter(
 /// groups over the same columns: every predicate reuses the same decoded arrays
 /// but creates and composes another row selection.
 ///
-/// Keep pairs separate because short-circuiting ordinary range predicates is
-/// frequently useful. Groups of three or more usually indicate a normalized
-/// boolean expression (for example, a disjunction of ranges converted to CNF).
+/// Even pairs are worth coalescing: both predicates decode the same arrays and
+/// the predicate cache otherwise visits those arrays once per bound.
 fn coalesce_repeated_projection_candidates(
     candidates: Vec<FilterCandidate>,
 ) -> Vec<FilterCandidate> {
-    const MIN_GROUP_SIZE: usize = 3;
+    const MIN_GROUP_SIZE: usize = 2;
 
     let mut groups: Vec<Vec<FilterCandidate>> = Vec::new();
     for candidate in candidates {
@@ -1293,7 +1292,6 @@ mod test {
         let predicate = col("a")
             .gt(Expr::Literal(ScalarValue::Int32(Some(1)), None))
             .and(col("a").lt(Expr::Literal(ScalarValue::Int32(Some(5)), None)))
-            .and(col("a").not_eq(Expr::Literal(ScalarValue::Int32(Some(3)), None)))
             .and(col("b").gt(Expr::Literal(ScalarValue::Int32(Some(1)), None)));
         let predicate = logical2physical(&predicate, &file_schema);
         let metrics = ExecutionPlanMetricsSet::new();
@@ -1306,7 +1304,7 @@ mod test {
         assert_eq!(
             row_filter.predicates().len(),
             2,
-            "the three predicates over a should share one decoder pass"
+            "the two predicates over a should share one decoder pass"
         );
 
         let rows: usize = parquet_reader_builder
@@ -1315,7 +1313,7 @@ mod test {
             .expect("filtered reader")
             .map(|batch| batch.expect("batch").num_rows())
             .sum();
-        assert_eq!(rows, 2);
+        assert_eq!(rows, 3);
     }
 
     #[test]
