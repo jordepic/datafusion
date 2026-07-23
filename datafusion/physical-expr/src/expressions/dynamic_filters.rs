@@ -66,6 +66,10 @@ pub struct DynamicFilterPhysicalExpr {
     /// If any of the children were remapped / modified (e.g. to adjust for projections) we need to keep track of the new children
     /// so that when we update `current()` in subsequent iterations we can re-apply the replacements.
     remapped_children: Option<Vec<Arc<dyn PhysicalExpr>>>,
+    /// The remapped expression is stable until the source filter advances to a new
+    /// generation. Cache it so evaluating a dynamic filter does not repeatedly walk
+    /// large expression trees such as an `IN` list with thousands of literals.
+    remapped_current: RwLock<Option<(u64, Arc<dyn PhysicalExpr>)>>,
     /// The source of dynamic filters.
     inner: Arc<RwLock<Inner>>,
     /// Broadcasts filter state (updates and completion) to all waiters.
@@ -186,6 +190,7 @@ impl DynamicFilterPhysicalExpr {
         Self {
             children,
             remapped_children: None, // Initially no remapped children
+            remapped_current: RwLock::new(None),
             inner: Arc::new(RwLock::new(Inner::new(inner))),
             state_watch,
             data_type: Arc::new(RwLock::new(None)),
@@ -231,8 +236,23 @@ impl DynamicFilterPhysicalExpr {
     /// This will return the current expression with any children
     /// remapped to match calls to [`PhysicalExpr::with_new_children`].
     pub fn current(&self) -> Result<Arc<dyn PhysicalExpr>> {
-        let expr = Arc::clone(self.inner.read().expr());
-        Self::remap_children(&self.children, self.remapped_children.as_ref(), expr)
+        let inner = self.inner.read().clone();
+        let Some(remapped_children) = self.remapped_children.as_ref() else {
+            return Ok(Arc::clone(inner.expr()));
+        };
+        if let Some((generation, expr)) = self.remapped_current.read().as_ref()
+            && *generation == inner.generation
+        {
+            return Ok(Arc::clone(expr));
+        }
+
+        let expr = Self::remap_children(
+            &self.children,
+            Some(remapped_children),
+            Arc::clone(inner.expr()),
+        )?;
+        *self.remapped_current.write() = Some((inner.generation, Arc::clone(&expr)));
+        Ok(expr)
     }
 
     /// Update the current expression and notify all waiters.
@@ -403,6 +423,7 @@ impl DynamicFilterPhysicalExpr {
         Self {
             children,
             remapped_children,
+            remapped_current: RwLock::new(None),
             inner: Arc::new(RwLock::new(inner)),
             state_watch,
             data_type: Arc::new(RwLock::new(None)),
@@ -435,6 +456,7 @@ impl PhysicalExpr for DynamicFilterPhysicalExpr {
         Ok(Arc::new(Self {
             children: self.children.clone(),
             remapped_children: Some(children),
+            remapped_current: RwLock::new(None),
             // Note: expression_id is preserved
             inner: Arc::clone(&self.inner),
             state_watch: self.state_watch.clone(),
@@ -595,6 +617,11 @@ mod test {
         .unwrap();
         let snap = dynamic_filter_1.snapshot().unwrap().unwrap();
         insta::assert_snapshot!(format!("{snap:?}"), @r#"BinaryExpr { left: Column { name: "a", index: 0 }, op: Eq, right: Literal { value: Int32(42), field: Field { name: "lit", data_type: Int32 } }, fail_on_overflow: false }"#);
+        let remapped_filter_1 = dynamic_filter_1
+            .downcast_ref::<DynamicFilterPhysicalExpr>()
+            .unwrap();
+        let cached = remapped_filter_1.current().unwrap();
+        assert!(Arc::ptr_eq(&snap, &cached));
         let dynamic_filter_2 = reassign_expr_columns(
             Arc::clone(&dynamic_filter) as Arc<dyn PhysicalExpr>,
             &filter_schema_2,
@@ -648,6 +675,9 @@ mod test {
         dynamic_filter
             .update(Arc::clone(&new_expr) as Arc<dyn PhysicalExpr>)
             .expect("Failed to update expression");
+        let updated = remapped_filter_1.current().unwrap();
+        assert!(!Arc::ptr_eq(&cached, &updated));
+        assert!(Arc::ptr_eq(&updated, &remapped_filter_1.current().unwrap()));
         // Now we should be able to evaluate the new expression on both batches
         let result_1 = dynamic_filter_1.evaluate(&batch_1).unwrap();
         let result_2 = dynamic_filter_2.evaluate(&batch_2).unwrap();
