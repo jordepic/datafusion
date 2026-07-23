@@ -83,7 +83,9 @@ use datafusion_common::cast::as_boolean_array;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor};
 use datafusion_physical_expr::ScalarFunctionExpr;
 use datafusion_physical_expr::expressions::{Column, Literal};
-use datafusion_physical_expr::utils::{collect_columns, reassign_expr_columns};
+use datafusion_physical_expr::utils::{
+    collect_columns, conjunction, reassign_expr_columns,
+};
 use datafusion_physical_expr::{PhysicalExpr, split_conjunction};
 
 use datafusion_physical_plan::metrics;
@@ -1048,6 +1050,8 @@ pub fn build_row_filter(
         candidates.sort_unstable_by_key(|c| c.required_bytes);
     }
 
+    candidates = coalesce_repeated_projection_candidates(candidates);
+
     // To avoid double-counting metrics when multiple predicates are used:
     // - All predicates should count rows_pruned (cumulative pruned rows)
     // - Only the last predicate should count rows_matched (final result)
@@ -1080,6 +1084,53 @@ pub fn build_row_filter(
         })
         .collect::<Result<Vec<_>, _>>()
         .map(|filters| Some(RowFilter::new(filters)))
+}
+
+/// Coalesces large groups of predicates that decode the exact same Parquet columns.
+///
+/// Applying each conjunct as a separate `ArrowPredicate` is useful when later
+/// predicates read different columns, as rows eliminated by an earlier predicate
+/// need not be decoded from those columns. It is counterproductive for large
+/// groups over the same columns: every predicate reuses the same decoded arrays
+/// but creates and composes another row selection.
+///
+/// Keep pairs separate because short-circuiting ordinary range predicates is
+/// frequently useful. Groups of three or more usually indicate a normalized
+/// boolean expression (for example, a disjunction of ranges converted to CNF).
+fn coalesce_repeated_projection_candidates(
+    candidates: Vec<FilterCandidate>,
+) -> Vec<FilterCandidate> {
+    const MIN_GROUP_SIZE: usize = 3;
+
+    let mut groups: Vec<Vec<FilterCandidate>> = Vec::new();
+    for candidate in candidates {
+        if let Some(group) = groups.iter_mut().find(|group| {
+            let first = &group[0];
+            first.read_plan.projection_mask == candidate.read_plan.projection_mask
+                && first.read_plan.projected_schema
+                    == candidate.read_plan.projected_schema
+        }) {
+            group.push(candidate);
+        } else {
+            groups.push(vec![candidate]);
+        }
+    }
+
+    groups
+        .into_iter()
+        .flat_map(|mut group| {
+            if group.len() < MIN_GROUP_SIZE {
+                return group;
+            }
+
+            let mut candidate = group.remove(0);
+            candidate.expr = conjunction(
+                std::iter::once(candidate.expr)
+                    .chain(group.into_iter().map(|candidate| candidate.expr)),
+            );
+            vec![candidate]
+        })
+        .collect()
 }
 
 /// Builds row filters for decoder runs.
@@ -1210,6 +1261,61 @@ mod test {
         let expected_mask =
             ProjectionMask::leaves(metadata.file_metadata().schema_descr(), [list_index]);
         assert_eq!(candidate.read_plan.projection_mask, expected_mask);
+    }
+
+    #[test]
+    fn coalesces_repeated_projection_predicates() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5])),
+                Arc::new(Int32Array::from(vec![5, 4, 3, 2, 1])),
+            ],
+        )
+        .expect("record batch");
+
+        let file = NamedTempFile::new().expect("temp file");
+        let mut writer =
+            ArrowWriter::try_new(file.reopen().unwrap(), schema, None).expect("writer");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close writer");
+
+        let reader_file = file.reopen().expect("reopen file");
+        let parquet_reader_builder =
+            ParquetRecordBatchReaderBuilder::try_new(reader_file).expect("reader");
+        let metadata = parquet_reader_builder.metadata().clone();
+        let file_schema = parquet_reader_builder.schema().clone();
+
+        let predicate = col("a")
+            .gt(Expr::Literal(ScalarValue::Int32(Some(1)), None))
+            .and(col("a").lt(Expr::Literal(ScalarValue::Int32(Some(5)), None)))
+            .and(col("a").not_eq(Expr::Literal(ScalarValue::Int32(Some(3)), None)))
+            .and(col("b").gt(Expr::Literal(ScalarValue::Int32(Some(1)), None)));
+        let predicate = logical2physical(&predicate, &file_schema);
+        let metrics = ExecutionPlanMetricsSet::new();
+        let file_metrics = ParquetFileMetrics::new(0, "coalesced.parquet", &metrics);
+
+        let row_filter =
+            build_row_filter(&predicate, &file_schema, &metadata, false, &file_metrics)
+                .expect("building row filter")
+                .expect("row filter");
+        assert_eq!(
+            row_filter.predicates().len(),
+            2,
+            "the three predicates over a should share one decoder pass"
+        );
+
+        let rows: usize = parquet_reader_builder
+            .with_row_filter(row_filter)
+            .build()
+            .expect("filtered reader")
+            .map(|batch| batch.expect("batch").num_rows())
+            .sum();
+        assert_eq!(rows, 2);
     }
 
     #[test]
