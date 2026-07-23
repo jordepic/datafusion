@@ -121,6 +121,9 @@ pub(crate) struct DatafusionArrowPredicate {
     rows_matched: metrics::Count,
     /// how long was spent evaluating this predicate
     time: metrics::Time,
+    trace_label: String,
+    trace_input_rows: usize,
+    trace_matched_rows: usize,
 }
 
 impl DatafusionArrowPredicate {
@@ -131,6 +134,14 @@ impl DatafusionArrowPredicate {
         rows_matched: metrics::Count,
         time: metrics::Time,
     ) -> Result<Self> {
+        let trace_label = candidate
+            .read_plan
+            .projected_schema
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>()
+            .join(",");
         let physical_expr =
             reassign_expr_columns(candidate.expr, &candidate.read_plan.projected_schema)?;
 
@@ -140,6 +151,9 @@ impl DatafusionArrowPredicate {
             rows_pruned,
             rows_matched,
             time,
+            trace_label,
+            trace_input_rows: 0,
+            trace_matched_rows: 0,
         })
     }
 }
@@ -160,6 +174,8 @@ impl ArrowPredicate for DatafusionArrowPredicate {
                 let bool_arr = as_boolean_array(&array)?.clone();
                 let num_matched = bool_arr.true_count();
                 let num_pruned = bool_arr.len() - num_matched;
+                self.trace_input_rows += bool_arr.len();
+                self.trace_matched_rows += num_matched;
                 self.rows_pruned.add(num_pruned);
                 self.rows_matched.add(num_matched);
                 timer.stop();
@@ -170,6 +186,15 @@ impl ArrowPredicate for DatafusionArrowPredicate {
                     "Error evaluating filter predicate: {e:?}"
                 ))
             })
+    }
+}
+
+impl Drop for DatafusionArrowPredicate {
+    fn drop(&mut self) {
+        eprintln!(
+            "DF_ROW_FILTER_TRACE columns={} input={} matched={}",
+            self.trace_label, self.trace_input_rows, self.trace_matched_rows
+        );
     }
 }
 
