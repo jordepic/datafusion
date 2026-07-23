@@ -26,11 +26,10 @@ use std::hash::{Hash, Hasher};
 
 use super::static_filter::StaticFilter;
 
-const MAX_INT32_BITMAP_BITS: usize = 1 << 20;
-// A bitmap uses one bit for every value in the span. Keep its size within
-// roughly 16 bytes per list entry, which is comparable to the storage needed
-// by the hash table while avoiding a hash lookup for every input row.
-const INT32_BITMAP_BITS_PER_VALUE: usize = 128;
+// Runtime filters commonly contain a few thousand sparse surrogate keys spread
+// over a much larger integer domain. A 32 MiB ceiling covers those filters
+// while still bounding the allocation for arbitrary SQL IN lists.
+const MAX_INT32_BITMAP_BITS: usize = 1 << 28;
 
 enum Int32FilterStorage {
     Bitmap { min: i32, bits: Vec<u64> },
@@ -53,11 +52,7 @@ impl Int32StaticFilter {
         let storage = match (values.iter().copied().min(), values.iter().copied().max()) {
             (Some(min), Some(max)) => {
                 let span = (i64::from(max) - i64::from(min) + 1) as usize;
-                let relative_limit = values
-                    .len()
-                    .saturating_mul(INT32_BITMAP_BITS_PER_VALUE)
-                    .max(256);
-                if span <= MAX_INT32_BITMAP_BITS && span <= relative_limit {
+                if span <= MAX_INT32_BITMAP_BITS {
                     let mut bits = vec![0_u64; span.div_ceil(64)];
                     for value in values {
                         let index = (i64::from(value) - i64::from(min)) as usize;
@@ -356,7 +351,7 @@ mod tests {
 
     #[test]
     fn int32_filter_uses_bitmap_within_memory_budget() -> Result<()> {
-        let values = (0..1_000).map(|value| value * 101).collect::<Vec<_>>();
+        let values = vec![0, 100_000_000];
         let values: ArrayRef = Arc::new(Int32Array::from(values));
 
         let filter = Int32StaticFilter::try_new(&values)?;
@@ -367,7 +362,7 @@ mod tests {
 
     #[test]
     fn int32_filter_uses_hash_beyond_memory_budget() -> Result<()> {
-        let values = (0..1_000).map(|value| value * 129).collect::<Vec<_>>();
+        let values = vec![0, 300_000_000];
         let values: ArrayRef = Arc::new(Int32Array::from(values));
 
         let filter = Int32StaticFilter::try_new(&values)?;
