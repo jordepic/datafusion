@@ -82,7 +82,9 @@ use datafusion_common::Result;
 use datafusion_common::cast::as_boolean_array;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor};
 use datafusion_physical_expr::ScalarFunctionExpr;
-use datafusion_physical_expr::expressions::{Column, Literal};
+use datafusion_physical_expr::expressions::{
+    Column, DynamicFilterPhysicalExpr, Literal,
+};
 use datafusion_physical_expr::utils::{
     collect_columns, conjunction, reassign_expr_columns,
 };
@@ -1027,7 +1029,14 @@ pub fn build_row_filter(
 
     // Split into conjuncts:
     // `a = 1 AND b = 2 AND c = 3` -> [`a = 1`, `b = 2`, `c = 3`]
-    let predicates = split_conjunction(expr);
+    let dynamic_snapshot = expr
+        .as_any()
+        .downcast_ref::<DynamicFilterPhysicalExpr>()
+        .map(DynamicFilterPhysicalExpr::current)
+        .transpose()?;
+    let predicates = dynamic_snapshot
+        .as_ref()
+        .map_or_else(|| split_conjunction(expr), split_conjunction);
 
     // Determine which conjuncts can be evaluated as ArrowPredicates, if any
     let mut candidates: Vec<FilterCandidate> = predicates
