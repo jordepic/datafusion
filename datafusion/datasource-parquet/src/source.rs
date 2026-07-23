@@ -424,6 +424,20 @@ impl ParquetSource {
         self.table_parquet_options.global.force_filter_selections
     }
 
+    /// Force Parquet row filters to materialize [`RowSelection`] selectors
+    /// instead of allowing the Arrow reader to choose a bitmap mask.
+    ///
+    /// Selectors let the decoder skip rejected row ranges and can be faster for
+    /// selective predicates. Bitmap masks can be faster for dense or highly
+    /// fragmented selections. Defaults to false.
+    ///
+    /// [`RowSelection`]: parquet::arrow::arrow_reader::RowSelection
+    pub fn with_force_filter_selections(mut self, force_filter_selections: bool) -> Self {
+        self.table_parquet_options.global.force_filter_selections =
+            force_filter_selections;
+        self
+    }
+
     /// If enabled, the reader will read the page index
     /// This is used to optimize filter pushdown
     /// via `RowSelector` and `RowFilter` by
