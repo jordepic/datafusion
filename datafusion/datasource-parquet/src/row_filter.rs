@@ -84,7 +84,9 @@ use datafusion_common::Result;
 use datafusion_common::cast::as_boolean_array;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor};
 use datafusion_physical_expr::ScalarFunctionExpr;
-use datafusion_physical_expr::expressions::{Column, DynamicFilterPhysicalExpr, Literal};
+use datafusion_physical_expr::expressions::{
+    Column, DynamicFilterPhysicalExpr, InListExpr, Literal,
+};
 use datafusion_physical_expr::utils::{
     collect_columns, conjunction, reassign_expr_columns,
 };
@@ -156,6 +158,14 @@ impl PrimitiveDictionaryPredicate for DatafusionPrimitiveDictionaryPredicate {
     }
 }
 
+fn is_exact_value_list_dynamic_filter(
+    dynamic_filter: &DynamicFilterPhysicalExpr,
+) -> bool {
+    dynamic_filter
+        .current()
+        .is_ok_and(|expr| expr.downcast_ref::<InListExpr>().is_some())
+}
+
 impl DatafusionArrowPredicate {
     /// Create a new `DatafusionArrowPredicate` from a `FilterCandidate`
     pub fn try_new(
@@ -168,6 +178,7 @@ impl DatafusionArrowPredicate {
             reassign_expr_columns(candidate.expr, &candidate.read_plan.projected_schema)?;
         let primitive_dictionary_predicate = physical_expr
             .downcast_ref::<DynamicFilterPhysicalExpr>()
+            .filter(|dynamic_filter| is_exact_value_list_dynamic_filter(dynamic_filter))
             .filter(|_| candidate.read_plan.projected_schema.fields().len() == 1)
             .filter(|_| {
                 matches!(
@@ -1312,6 +1323,25 @@ mod test {
     use tempfile::NamedTempFile;
 
     use datafusion_physical_expr::expressions::Column as PhysicalColumn;
+
+    #[test]
+    fn primitive_dictionary_predicate_requires_exact_value_list() {
+        let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
+        let column = Arc::new(PhysicalColumn::new("a", 0)) as Arc<dyn PhysicalExpr>;
+
+        let exact = col("a").in_list(
+            vec![Expr::Literal(ScalarValue::Int32(Some(1)), None)],
+            false,
+        );
+        let exact = logical2physical(&exact, &schema);
+        let exact = DynamicFilterPhysicalExpr::new(vec![Arc::clone(&column)], exact);
+        assert!(is_exact_value_list_dynamic_filter(&exact));
+
+        let range = col("a").gt_eq(Expr::Literal(ScalarValue::Int32(Some(1)), None));
+        let range = logical2physical(&range, &schema);
+        let range = DynamicFilterPhysicalExpr::new(vec![column], range);
+        assert!(!is_exact_value_list_dynamic_filter(&range));
+    }
 
     // List predicates used by the decoder should be accepted for pushdown
     #[test]
