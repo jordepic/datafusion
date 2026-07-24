@@ -140,6 +140,12 @@ struct DatafusionPrimitiveDictionaryPredicate {
 }
 
 impl PrimitiveDictionaryPredicate for DatafusionPrimitiveDictionaryPredicate {
+    fn can_evaluate_dictionary(&self) -> bool {
+        self.physical_expr
+            .downcast_ref::<DynamicFilterPhysicalExpr>()
+            .is_some_and(is_exact_value_list_dynamic_filter)
+    }
+
     fn evaluate(&self, values: ArrayRef) -> ArrowResult<BooleanArray> {
         let timer = self.time.timer();
         let batch = RecordBatch::try_new(Arc::clone(&self.schema), vec![values])?;
@@ -178,7 +184,6 @@ impl DatafusionArrowPredicate {
             reassign_expr_columns(candidate.expr, &candidate.read_plan.projected_schema)?;
         let primitive_dictionary_predicate = physical_expr
             .downcast_ref::<DynamicFilterPhysicalExpr>()
-            .filter(|dynamic_filter| is_exact_value_list_dynamic_filter(dynamic_filter))
             .filter(|_| candidate.read_plan.projected_schema.fields().len() == 1)
             .filter(|_| {
                 matches!(
