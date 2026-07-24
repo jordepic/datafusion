@@ -16,11 +16,10 @@
 // under the License.
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, downcast_array, downcast_dictionary_array,
-    make_comparator,
+    Array, ArrayRef, BooleanArray, downcast_dictionary_array, make_comparator,
 };
 use arrow::buffer::{BooleanBuffer, NullBuffer};
-use arrow::compute::{SortOptions, take};
+use arrow::compute::SortOptions;
 use arrow::datatypes::DataType;
 use arrow::util::bit_iterator::BitIndexIterator;
 use datafusion_common::HashMap;
@@ -28,7 +27,7 @@ use datafusion_common::Result;
 use datafusion_common::hash_utils::{RandomState, with_hashes};
 use hashbrown::hash_map::RawEntryMut;
 
-use super::static_filter::StaticFilter;
+use super::static_filter::{StaticFilter, remap_dictionary_predicate};
 
 /// Static filter for InList that stores the array and hash set for O(1) lookups
 #[derive(Debug, Clone)]
@@ -69,8 +68,7 @@ impl StaticFilter for ArrayStaticFilter {
                 // the dictionary value type
                 if v.values().data_type() == self.in_array.data_type() {
                     let values_contains = self.contains(v.values().as_ref(), negated)?;
-                    let result = take(&values_contains, v.keys(), None)?;
-                    return Ok(downcast_array(result.as_ref()));
+                    return Ok(remap_dictionary_predicate(v, &values_contains));
                 }
             }
             _ => {}

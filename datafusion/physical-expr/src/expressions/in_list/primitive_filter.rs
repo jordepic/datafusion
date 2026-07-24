@@ -15,16 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, downcast_array, downcast_dictionary_array,
-};
+use arrow::array::{Array, ArrayRef, AsArray, BooleanArray, downcast_dictionary_array};
 use arrow::buffer::{BooleanBuffer, NullBuffer};
-use arrow::compute::take;
 use arrow::datatypes::*;
 use datafusion_common::{HashSet, Result, exec_datafusion_err};
 use std::hash::{Hash, Hasher};
 
-use super::static_filter::StaticFilter;
+use super::static_filter::{StaticFilter, remap_dictionary_predicate};
 
 // Runtime filters commonly contain a few thousand sparse surrogate keys spread
 // over a much larger integer domain. A 32 MiB ceiling covers those filters
@@ -98,8 +95,7 @@ impl StaticFilter for Int32StaticFilter {
         downcast_dictionary_array! {
             v => {
                 let values_contains = self.contains(v.values().as_ref(), negated)?;
-                let result = take(&values_contains, v.keys(), None)?;
-                return Ok(downcast_array(result.as_ref()))
+                return Ok(remap_dictionary_predicate(v, &values_contains))
             }
             _ => {}
         }
@@ -231,8 +227,7 @@ macro_rules! primitive_static_filter {
                 downcast_dictionary_array! {
                     v => {
                         let values_contains = self.contains(v.values().as_ref(), negated)?;
-                        let result = take(&values_contains, v.keys(), None)?;
-                        return Ok(downcast_array(result.as_ref()))
+                        return Ok(remap_dictionary_predicate(v, &values_contains))
                     }
                     _ => {}
                 }
