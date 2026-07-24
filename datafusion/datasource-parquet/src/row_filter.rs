@@ -77,6 +77,7 @@ use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{
     ArrowPredicate, PrimitiveDictionaryPredicate, RowFilter,
 };
+use parquet::basic::Encoding;
 use parquet::file::metadata::ParquetMetaData;
 use parquet::schema::types::SchemaDescriptor;
 
@@ -188,6 +189,7 @@ impl DatafusionArrowPredicate {
         let primitive_dictionary_predicate = physical_expr
             .downcast_ref::<DynamicFilterPhysicalExpr>()
             .filter(|_| candidate.read_plan.projected_schema.fields().len() == 1)
+            .filter(|_| candidate.read_plan.primitive_dictionary_encoded)
             .filter(|_| {
                 matches!(
                     candidate.read_plan.projected_schema.field(0).data_type(),
@@ -296,6 +298,12 @@ pub(crate) struct ParquetReadPlan {
     /// The projected Arrow schema containing only the columns/fields required
     /// Struct types are pruned to include only the accessed sub-fields
     pub projected_schema: SchemaRef,
+    /// Whether every row group encodes the single projected leaf with dictionary IDs.
+    ///
+    /// The primitive dictionary predicate reader has a plain-page compatibility path, but
+    /// selecting it for a column with no dictionary pages adds an avoidable decode and Boolean
+    /// packing layer. Keep ordinary Arrow predicate evaluation for those columns.
+    primitive_dictionary_encoded: bool,
 }
 
 /// Helper to build a `FilterCandidate`.
@@ -667,6 +675,8 @@ pub(crate) fn build_parquet_read_plan(
     leaf_indices.dedup();
 
     let required_bytes = size_of_columns(&leaf_indices, metadata)?;
+    let primitive_dictionary_encoded =
+        is_dictionary_encoded_single_leaf(&leaf_indices, metadata);
 
     let projection_mask =
         ProjectionMask::leaves(schema_descr, leaf_indices.iter().copied());
@@ -681,6 +691,7 @@ pub(crate) fn build_parquet_read_plan(
         ParquetReadPlan {
             projection_mask,
             projected_schema,
+            primitive_dictionary_encoded,
         },
         required_bytes,
     )))
@@ -723,6 +734,7 @@ pub(crate) fn build_projection_read_plan(
         return ParquetReadPlan {
             projection_mask,
             projected_schema,
+            primitive_dictionary_encoded: false,
         };
     }
 
@@ -754,6 +766,7 @@ pub(crate) fn build_projection_read_plan(
         return ParquetReadPlan {
             projection_mask,
             projected_schema,
+            primitive_dictionary_encoded: false,
         };
     }
 
@@ -786,6 +799,7 @@ pub(crate) fn build_projection_read_plan(
         return ParquetReadPlan {
             projection_mask,
             projected_schema,
+            primitive_dictionary_encoded: false,
         };
     }
 
@@ -811,7 +825,26 @@ pub(crate) fn build_projection_read_plan(
     ParquetReadPlan {
         projection_mask,
         projected_schema,
+        primitive_dictionary_encoded: false,
     }
+}
+
+fn is_dictionary_encoded_single_leaf(
+    leaf_indices: &[usize],
+    metadata: &ParquetMetaData,
+) -> bool {
+    let [leaf_index] = leaf_indices else {
+        return false;
+    };
+    !metadata.row_groups().is_empty()
+        && metadata.row_groups().iter().all(|row_group| {
+            row_group.column(*leaf_index).encodings().any(|encoding| {
+                matches!(
+                    encoding,
+                    Encoding::PLAIN_DICTIONARY | Encoding::RLE_DICTIONARY
+                )
+            })
+        })
 }
 
 fn leaf_indices_for_roots<I>(
@@ -1327,6 +1360,7 @@ mod test {
     use parquet::arrow::ArrowWriter;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use parquet::arrow::parquet_to_arrow_schema;
+    use parquet::file::properties::WriterProperties;
     use parquet::file::reader::{FileReader, SerializedFileReader};
     use tempfile::NamedTempFile;
 
@@ -1360,6 +1394,39 @@ mod test {
         let range = logical2physical(&range, &schema);
         let range = DynamicFilterPhysicalExpr::new(vec![column], range);
         assert!(!is_exact_value_list_dynamic_filter(&range));
+    }
+
+    #[test]
+    fn primitive_dictionary_predicate_requires_dictionary_encoded_column() {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from_iter_values(0..1024))],
+        )
+        .expect("record batch");
+
+        for dictionary_enabled in [false, true] {
+            let file = NamedTempFile::new().expect("temp file");
+            let properties = WriterProperties::builder()
+                .set_dictionary_enabled(dictionary_enabled)
+                .build();
+            let mut writer = ArrowWriter::try_new(
+                file.reopen().expect("reopen file"),
+                Arc::clone(&schema),
+                Some(properties),
+            )
+            .expect("writer");
+            writer.write(&batch).expect("write batch");
+            writer.close().expect("close writer");
+
+            let reader_file = file.reopen().expect("reopen file");
+            let reader =
+                ParquetRecordBatchReaderBuilder::try_new(reader_file).expect("reader");
+            assert_eq!(
+                is_dictionary_encoded_single_leaf(&[0], reader.metadata()),
+                dictionary_enabled
+            );
+        }
     }
 
     // List predicates used by the decoder should be accepted for pushdown
