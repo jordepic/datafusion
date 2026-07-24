@@ -140,12 +140,6 @@ struct DatafusionPrimitiveDictionaryPredicate {
 }
 
 impl PrimitiveDictionaryPredicate for DatafusionPrimitiveDictionaryPredicate {
-    fn can_evaluate_dictionary(&self) -> bool {
-        self.physical_expr
-            .downcast_ref::<DynamicFilterPhysicalExpr>()
-            .is_some_and(is_exact_value_list_dynamic_filter)
-    }
-
     fn evaluate(&self, values: ArrayRef) -> ArrowResult<BooleanArray> {
         let timer = self.time.timer();
         let batch = RecordBatch::try_new(Arc::clone(&self.schema), vec![values])?;
@@ -169,7 +163,10 @@ fn is_exact_value_list_dynamic_filter(
 ) -> bool {
     dynamic_filter
         .current()
-        .is_ok_and(|expr| expr.downcast_ref::<InListExpr>().is_some())
+        .and_then(|expr| {
+            expr.exists(|expr| Ok(expr.downcast_ref::<InListExpr>().is_some()))
+        })
+        .unwrap_or(false)
 }
 
 impl DatafusionArrowPredicate {
@@ -219,13 +216,17 @@ impl ArrowPredicate for DatafusionArrowPredicate {
     }
 
     fn preserve_primitive_dictionaries(&self) -> bool {
-        self.primitive_dictionary_predicate.is_some()
+        self.physical_expr
+            .downcast_ref::<DynamicFilterPhysicalExpr>()
+            .is_some_and(is_exact_value_list_dynamic_filter)
     }
 
     fn primitive_dictionary_predicate(
         &self,
     ) -> Option<Arc<dyn PrimitiveDictionaryPredicate>> {
-        self.primitive_dictionary_predicate.clone()
+        self.preserve_primitive_dictionaries()
+            .then(|| self.primitive_dictionary_predicate.clone())
+            .flatten()
     }
 
     fn evaluate_precomputed(
@@ -1341,6 +1342,17 @@ mod test {
         let exact = logical2physical(&exact, &schema);
         let exact = DynamicFilterPhysicalExpr::new(vec![Arc::clone(&column)], exact);
         assert!(is_exact_value_list_dynamic_filter(&exact));
+
+        let exact_with_bounds = col("a")
+            .in_list(
+                vec![Expr::Literal(ScalarValue::Int32(Some(1)), None)],
+                false,
+            )
+            .and(col("a").gt_eq(Expr::Literal(ScalarValue::Int32(Some(1)), None)));
+        let exact_with_bounds = logical2physical(&exact_with_bounds, &schema);
+        let exact_with_bounds =
+            DynamicFilterPhysicalExpr::new(vec![Arc::clone(&column)], exact_with_bounds);
+        assert!(is_exact_value_list_dynamic_filter(&exact_with_bounds));
 
         let range = col("a").gt_eq(Expr::Literal(ScalarValue::Int32(Some(1)), None));
         let range = logical2physical(&range, &schema);
