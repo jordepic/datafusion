@@ -68,13 +68,15 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use arrow::array::BooleanArray;
+use arrow::array::{ArrayRef, BooleanArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::error::{ArrowError, Result as ArrowResult};
 use arrow::record_batch::RecordBatch;
 use datafusion_functions::core::getfield::GetFieldFunc;
 use parquet::arrow::ProjectionMask;
-use parquet::arrow::arrow_reader::{ArrowPredicate, RowFilter};
+use parquet::arrow::arrow_reader::{
+    ArrowPredicate, PrimitiveDictionaryPredicate, RowFilter,
+};
 use parquet::file::metadata::ParquetMetaData;
 use parquet::schema::types::SchemaDescriptor;
 
@@ -124,9 +126,34 @@ pub(crate) struct DatafusionArrowPredicate {
     rows_matched: metrics::Count,
     /// how long was spent evaluating this predicate
     time: metrics::Time,
-    /// Whether the predicate is a live dynamic filter that can evaluate
-    /// dictionary-encoded primitive inputs without expanding every value.
-    preserve_primitive_dictionaries: bool,
+    /// Evaluates a live dynamic filter once per primitive Parquet dictionary.
+    primitive_dictionary_predicate: Option<Arc<dyn PrimitiveDictionaryPredicate>>,
+}
+
+#[derive(Debug)]
+struct DatafusionPrimitiveDictionaryPredicate {
+    physical_expr: Arc<dyn PhysicalExpr>,
+    schema: SchemaRef,
+    time: metrics::Time,
+}
+
+impl PrimitiveDictionaryPredicate for DatafusionPrimitiveDictionaryPredicate {
+    fn evaluate(&self, values: ArrayRef) -> ArrowResult<BooleanArray> {
+        let timer = self.time.timer();
+        let batch = RecordBatch::try_new(Arc::clone(&self.schema), vec![values])?;
+        let filter = self
+            .physical_expr
+            .evaluate(&batch)
+            .and_then(|value| value.into_array(batch.num_rows()))
+            .and_then(|array| Ok(as_boolean_array(&array)?.clone()))
+            .map_err(|error| {
+                ArrowError::ComputeError(format!(
+                    "Error evaluating primitive dictionary predicate: {error:?}"
+                ))
+            })?;
+        timer.done();
+        Ok(filter)
+    }
 }
 
 impl DatafusionArrowPredicate {
@@ -139,9 +166,25 @@ impl DatafusionArrowPredicate {
     ) -> Result<Self> {
         let physical_expr =
             reassign_expr_columns(candidate.expr, &candidate.read_plan.projected_schema)?;
-        let preserve_primitive_dictionaries = physical_expr
+        let primitive_dictionary_predicate = physical_expr
             .downcast_ref::<DynamicFilterPhysicalExpr>()
-            .is_some();
+            .filter(|_| candidate.read_plan.projected_schema.fields().len() == 1)
+            .filter(|_| {
+                matches!(
+                    candidate.read_plan.projected_schema.field(0).data_type(),
+                    DataType::Int32
+                        | DataType::Int64
+                        | DataType::Float32
+                        | DataType::Float64
+                )
+            })
+            .map(|_| {
+                Arc::new(DatafusionPrimitiveDictionaryPredicate {
+                    physical_expr: Arc::clone(&physical_expr),
+                    schema: Arc::clone(&candidate.read_plan.projected_schema),
+                    time: time.clone(),
+                }) as Arc<dyn PrimitiveDictionaryPredicate>
+            });
 
         Ok(Self {
             physical_expr,
@@ -149,7 +192,7 @@ impl DatafusionArrowPredicate {
             rows_pruned,
             rows_matched,
             time,
-            preserve_primitive_dictionaries,
+            primitive_dictionary_predicate,
         })
     }
 }
@@ -160,7 +203,23 @@ impl ArrowPredicate for DatafusionArrowPredicate {
     }
 
     fn preserve_primitive_dictionaries(&self) -> bool {
-        self.preserve_primitive_dictionaries
+        self.primitive_dictionary_predicate.is_some()
+    }
+
+    fn primitive_dictionary_predicate(
+        &self,
+    ) -> Option<Arc<dyn PrimitiveDictionaryPredicate>> {
+        self.primitive_dictionary_predicate.clone()
+    }
+
+    fn evaluate_precomputed(
+        &mut self,
+        filter: BooleanArray,
+    ) -> ArrowResult<BooleanArray> {
+        let num_matched = filter.true_count();
+        self.rows_pruned.add(filter.len() - num_matched);
+        self.rows_matched.add(num_matched);
+        Ok(filter)
     }
 
     fn evaluate(&mut self, batch: RecordBatch) -> ArrowResult<BooleanArray> {
