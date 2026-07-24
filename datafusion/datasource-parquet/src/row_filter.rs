@@ -82,7 +82,7 @@ use datafusion_common::Result;
 use datafusion_common::cast::as_boolean_array;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor};
 use datafusion_physical_expr::ScalarFunctionExpr;
-use datafusion_physical_expr::expressions::{Column, Literal};
+use datafusion_physical_expr::expressions::{Column, DynamicFilterPhysicalExpr, Literal};
 use datafusion_physical_expr::utils::{
     collect_columns, conjunction, reassign_expr_columns,
 };
@@ -124,6 +124,9 @@ pub(crate) struct DatafusionArrowPredicate {
     rows_matched: metrics::Count,
     /// how long was spent evaluating this predicate
     time: metrics::Time,
+    /// Whether the predicate is a live dynamic filter that can evaluate
+    /// dictionary-encoded primitive inputs without expanding every value.
+    preserve_primitive_dictionaries: bool,
 }
 
 impl DatafusionArrowPredicate {
@@ -136,6 +139,9 @@ impl DatafusionArrowPredicate {
     ) -> Result<Self> {
         let physical_expr =
             reassign_expr_columns(candidate.expr, &candidate.read_plan.projected_schema)?;
+        let preserve_primitive_dictionaries = physical_expr
+            .downcast_ref::<DynamicFilterPhysicalExpr>()
+            .is_some();
 
         Ok(Self {
             physical_expr,
@@ -143,6 +149,7 @@ impl DatafusionArrowPredicate {
             rows_pruned,
             rows_matched,
             time,
+            preserve_primitive_dictionaries,
         })
     }
 }
@@ -150,6 +157,10 @@ impl DatafusionArrowPredicate {
 impl ArrowPredicate for DatafusionArrowPredicate {
     fn projection(&self) -> &ProjectionMask {
         &self.projection_mask
+    }
+
+    fn preserve_primitive_dictionaries(&self) -> bool {
+        self.preserve_primitive_dictionaries
     }
 
     fn evaluate(&mut self, batch: RecordBatch) -> ArrowResult<BooleanArray> {
