@@ -59,6 +59,14 @@ use futures::ready;
 use futures::stream::{Stream, StreamExt};
 use log::debug;
 
+/// Bound materialized grouping-key data well below Arrow's 2 GiB `Utf8`/`Binary` offset limit.
+///
+/// Emitting only `batch_size` groups is also undesirable: `EmitTo::First` must renumber and
+/// maintain every remaining group, making terminal output quadratic for high-cardinality
+/// aggregates. This byte budget amortizes that work while the stream still returns record batches
+/// sliced to `batch_size`.
+const MAX_AGGREGATE_OUTPUT_GROUP_VALUES_BYTES: usize = 512 * 1024 * 1024;
+
 #[derive(Debug, Clone)]
 /// This object tracks the aggregation phase (input/output)
 pub(crate) enum ExecutionState {
@@ -355,6 +363,21 @@ enum OutOfMemoryMode {
 /// │ 2 │ 2     │ 3.0 │    │ 2 │ 2     │ 3.0 │                   └────────────┘
 /// └─────────────────┘    └─────────────────┘
 /// ```
+fn bounded_output_group_count(
+    group_count: usize,
+    group_values_size: usize,
+    batch_size: usize,
+) -> usize {
+    if group_count == 0 {
+        return 0;
+    }
+
+    let estimated_bytes_per_group = group_values_size.div_ceil(group_count).max(1);
+    let groups_within_budget =
+        MAX_AGGREGATE_OUTPUT_GROUP_VALUES_BYTES / estimated_bytes_per_group;
+    group_count.min(groups_within_budget.max(batch_size))
+}
+
 pub(crate) struct GroupedHashAggregateStream {
     // ========================================================================
     // PROPERTIES:
@@ -1321,10 +1344,16 @@ impl GroupedHashAggregateStream {
     /// Materializes at most one output batch from the remaining aggregate groups.
     ///
     /// Building every group into one `RecordBatch` before slicing can overflow the 32-bit offset
-    /// buffer of `Utf8` and `Binary` grouping columns. Emit directly in the configured batch size
-    /// instead, keeping both the row count and variable-width buffers bounded.
+    /// buffer of `Utf8` and `Binary` grouping columns. Repeatedly emitting only `batch_size` groups
+    /// is quadratic because `EmitTo::First` maintains and renumbers all remaining groups. Estimate
+    /// a byte-bounded chunk from the group store, then let `ProducingOutput` slice that chunk to the
+    /// configured output batch size.
     fn next_output_state(&mut self) -> Result<ExecutionState> {
-        let groups_to_emit = self.group_values.len().min(self.batch_size);
+        let groups_to_emit = bounded_output_group_count(
+            self.group_values.len(),
+            self.group_values.size(),
+            self.batch_size,
+        );
         if groups_to_emit == 0 {
             return Ok(ExecutionState::Done);
         }
@@ -1492,7 +1521,7 @@ mod tests {
     use datafusion_physical_expr::expressions::col;
 
     #[tokio::test]
-    async fn test_final_output_materializes_one_batch_at_a_time() -> Result<()> {
+    async fn test_final_output_materializes_bounded_chunks() -> Result<()> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("group_col", DataType::Utf8, false),
             Field::new("value_col", DataType::Int64, false),
@@ -1542,9 +1571,9 @@ mod tests {
             .transpose()?
             .expect("first output batch");
         assert_eq!(first.num_rows(), batch_size);
-        // The stream eagerly stages one additional bounded output batch while returning the
-        // current one, so two batches have been removed from the group store at this point.
-        assert_eq!(stream.group_values.len(), num_groups - (2 * batch_size));
+        // This small group store fits within the byte budget, so it is materialized once and the
+        // stream returns batch-sized slices without repeatedly renumbering the remaining groups.
+        assert_eq!(stream.group_values.len(), 0);
 
         let mut output_rows = first.num_rows();
         while let Some(batch) = stream.next().await.transpose()? {
@@ -1553,6 +1582,20 @@ mod tests {
         }
         assert_eq!(output_rows, num_groups);
         Ok(())
+    }
+
+    #[test]
+    fn test_output_group_count_uses_byte_budget() {
+        let group_count = 1_000_000;
+        let group_values_size = 2 * MAX_AGGREGATE_OUTPUT_GROUP_VALUES_BYTES;
+        let expected_groups = MAX_AGGREGATE_OUTPUT_GROUP_VALUES_BYTES
+            / group_values_size.div_ceil(group_count);
+        assert_eq!(
+            bounded_output_group_count(group_count, group_values_size, 8_192),
+            expected_groups
+        );
+        assert_eq!(bounded_output_group_count(10, 1_000, 8_192), 10);
+        assert_eq!(bounded_output_group_count(0, 0, 8_192), 0);
     }
 
     #[tokio::test]
