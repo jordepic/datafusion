@@ -66,6 +66,9 @@ use log::debug;
 /// aggregates. This byte budget amortizes that work while the stream still returns record batches
 /// sliced to `batch_size`.
 const MAX_AGGREGATE_OUTPUT_GROUP_VALUES_BYTES: usize = 512 * 1024 * 1024;
+/// `GroupValues::size()` is not a strict upper bound for emitted variable-width buffers, so also
+/// cap the number of groups independently. The configured batch size takes precedence if larger.
+const MAX_AGGREGATE_OUTPUT_GROUPS: usize = 256 * 1024;
 
 #[derive(Debug, Clone)]
 /// This object tracks the aggregation phase (input/output)
@@ -375,7 +378,8 @@ fn bounded_output_group_count(
     let estimated_bytes_per_group = group_values_size.div_ceil(group_count).max(1);
     let groups_within_budget =
         MAX_AGGREGATE_OUTPUT_GROUP_VALUES_BYTES / estimated_bytes_per_group;
-    group_count.min(groups_within_budget.max(batch_size))
+    let maximum_groups = MAX_AGGREGATE_OUTPUT_GROUPS.max(batch_size);
+    group_count.min(groups_within_budget.max(batch_size).min(maximum_groups))
 }
 
 pub(crate) struct GroupedHashAggregateStream {
@@ -1592,7 +1596,11 @@ mod tests {
             / group_values_size.div_ceil(group_count);
         assert_eq!(
             bounded_output_group_count(group_count, group_values_size, 8_192),
-            expected_groups
+            expected_groups.min(MAX_AGGREGATE_OUTPUT_GROUPS)
+        );
+        assert_eq!(
+            bounded_output_group_count(group_count, 1, 8_192),
+            MAX_AGGREGATE_OUTPUT_GROUPS
         );
         assert_eq!(bounded_output_group_count(10, 1_000, 8_192), 10);
         assert_eq!(bounded_output_group_count(0, 0, 8_192), 0);
