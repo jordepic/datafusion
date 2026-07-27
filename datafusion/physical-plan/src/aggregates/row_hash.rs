@@ -856,21 +856,17 @@ impl Stream for GroupedHashAggregateStream {
                     let output_batch;
                     let size = self.batch_size;
                     (self.exec_state, output_batch) = if batch.num_rows() <= size {
-                        (
-                            if self.input_done {
-                                ExecutionState::Done
-                            }
-                            // In Partial aggregation, we also need to check
-                            // if we should trigger partial skipping
-                            else if self.mode == AggregateMode::Partial
-                                && self.should_skip_aggregation()
-                            {
-                                ExecutionState::SkippingAggregation
-                            } else {
-                                ExecutionState::ReadingInput
-                            },
-                            batch.clone(),
-                        )
+                        let output_batch = batch.clone();
+                        let next_state = if self.input_done {
+                            self.next_output_state()?
+                        } else if self.mode == AggregateMode::Partial
+                            && self.should_skip_aggregation()
+                        {
+                            ExecutionState::SkippingAggregation
+                        } else {
+                            ExecutionState::ReadingInput
+                        };
+                        (next_state, output_batch)
                     } else {
                         // output first batch_size rows
                         let size = self.batch_size;
@@ -1322,6 +1318,20 @@ impl GroupedHashAggregateStream {
         group_values_soft_limit <= self.group_values.len()
     }
 
+    /// Materializes at most one output batch from the remaining aggregate groups.
+    ///
+    /// Building every group into one `RecordBatch` before slicing can overflow the 32-bit offset
+    /// buffer of `Utf8` and `Binary` grouping columns. Emit directly in the configured batch size
+    /// instead, keeping both the row count and variable-width buffers bounded.
+    fn next_output_state(&mut self) -> Result<ExecutionState> {
+        let groups_to_emit = self.group_values.len().min(self.batch_size);
+        if groups_to_emit == 0 {
+            return Ok(ExecutionState::Done);
+        }
+        let batch = self.emit(EmitTo::First(groups_to_emit), false)?;
+        Ok(batch.map_or(ExecutionState::Done, ExecutionState::ProducingOutput))
+    }
+
     /// Finalizes reading of the input stream and prepares for producing output values.
     ///
     /// This method is called both when the original input stream and,
@@ -1340,11 +1350,9 @@ impl GroupedHashAggregateStream {
             // Input has been entirely processed without spilling to disk.
             self.init_empty_grouping_sets()?;
 
-            // Flush any remaining group values.
-            let batch = self.emit(EmitTo::All, false)?;
-
-            // If there are none, we're done; otherwise switch to emitting them
-            batch.map_or(ExecutionState::Done, ExecutionState::ProducingOutput)
+            // Flush remaining group values in bounded batches. Materializing all groups before
+            // slicing can overflow 32-bit variable-width offsets on high-cardinality aggregates.
+            self.next_output_state()?
         } else {
             // Spill any remaining data to disk. There is some performance overhead in
             // writing out this last chunk of data and reading it back. The benefit of
@@ -1475,12 +1483,77 @@ mod tests {
     use crate::InputOrderMode;
     use crate::execution_plan::ExecutionPlan;
     use crate::test::TestMemoryExec;
-    use arrow::array::{Int32Array, Int64Array};
+    use arrow::array::{Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion_execution::config::SessionConfig;
     use datafusion_execution::runtime_env::RuntimeEnvBuilder;
     use datafusion_functions_aggregate::count::count_udaf;
     use datafusion_physical_expr::aggregate::AggregateExprBuilder;
     use datafusion_physical_expr::expressions::col;
+
+    #[tokio::test]
+    async fn test_final_output_materializes_one_batch_at_a_time() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("group_col", DataType::Utf8, false),
+            Field::new("value_col", DataType::Int64, false),
+        ]));
+        let num_groups = 10;
+        let batch_size = 3;
+        let group_values = (0..num_groups)
+            .map(|index| format!("group-{index}"))
+            .collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(group_values)),
+                Arc::new(Int64Array::from(vec![1; num_groups])),
+            ],
+        )?;
+        let input_partitions = vec![vec![batch]];
+        let exec = TestMemoryExec::try_new(&input_partitions, Arc::clone(&schema), None)?;
+        let exec = Arc::new(TestMemoryExec::update_cache(&Arc::new(exec)));
+        let aggregate_exec = AggregateExec::try_new(
+            AggregateMode::Final,
+            PhysicalGroupBy::new_single(vec![(
+                col("group_col", &schema)?,
+                "group_col".to_string(),
+            )]),
+            vec![Arc::new(
+                AggregateExprBuilder::new(count_udaf(), vec![col("value_col", &schema)?])
+                    .schema(Arc::clone(&schema))
+                    .alias("count_value")
+                    .build()?,
+            )],
+            vec![None],
+            exec,
+            Arc::clone(&schema),
+        )?;
+        let runtime = RuntimeEnvBuilder::default().build_arc()?;
+        let task_ctx = Arc::new(
+            TaskContext::default()
+                .with_runtime(runtime)
+                .with_session_config(SessionConfig::new().with_batch_size(batch_size)),
+        );
+        let mut stream = GroupedHashAggregateStream::new(&aggregate_exec, &task_ctx, 0)?;
+
+        let first = stream
+            .next()
+            .await
+            .transpose()?
+            .expect("first output batch");
+        assert_eq!(first.num_rows(), batch_size);
+        // The stream eagerly stages one additional bounded output batch while returning the
+        // current one, so two batches have been removed from the group store at this point.
+        assert_eq!(stream.group_values.len(), num_groups - (2 * batch_size));
+
+        let mut output_rows = first.num_rows();
+        while let Some(batch) = stream.next().await.transpose()? {
+            assert!(batch.num_rows() <= batch_size);
+            output_rows += batch.num_rows();
+        }
+        assert_eq!(output_rows, num_groups);
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_double_emission_race_condition_bug() -> Result<()> {
