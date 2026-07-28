@@ -132,24 +132,6 @@ impl StaticFilter for Int32StaticFilter {
 
         Ok(BooleanArray::new(contains_buffer, result_nulls))
     }
-
-    fn contains_values(&self, v: &dyn Array, negated: bool) -> Result<Vec<u8>> {
-        if self.null_count != 0 {
-            return Ok(self
-                .contains(v, negated)?
-                .iter()
-                .map(|value| u8::from(value.unwrap_or(false)))
-                .collect());
-        }
-
-        let v = v.as_primitive_opt::<Int32Type>().ok_or_else(|| {
-            exec_datafusion_err!("Failed to downcast an array to an 'Int32Type' array")
-        })?;
-        Ok(v.values()
-            .iter()
-            .map(|value| u8::from(self.contains_value(*value) != negated))
-            .collect())
-    }
 }
 
 /// Wrapper for f32 that implements Hash and Eq using bit comparison.

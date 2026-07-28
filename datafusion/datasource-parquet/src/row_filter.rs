@@ -77,16 +77,16 @@ use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{
     ArrowPredicate, PrimitiveDictionaryPredicate, RowFilter,
 };
+use parquet::basic::Encoding;
 use parquet::file::metadata::ParquetMetaData;
 use parquet::schema::types::SchemaDescriptor;
 
 use datafusion_common::cast::as_boolean_array;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor};
 use datafusion_common::{Result, ScalarValue};
-use datafusion_expr::Operator;
 use datafusion_physical_expr::ScalarFunctionExpr;
 use datafusion_physical_expr::expressions::{
-    BinaryExpr, Column, DynamicFilterPhysicalExpr, InListExpr, Literal,
+    Column, DynamicFilterPhysicalExpr, InListExpr, Literal,
 };
 use datafusion_physical_expr::utils::{
     collect_columns, conjunction, reassign_expr_columns,
@@ -163,56 +163,6 @@ impl PrimitiveDictionaryPredicate for DatafusionPrimitiveDictionaryPredicate {
         timer.done();
         Ok(filter)
     }
-
-    fn evaluate_values(&self, values: ArrayRef) -> ArrowResult<Vec<u8>> {
-        let timer = self.time.timer();
-        let batch = RecordBatch::try_new(Arc::clone(&self.schema), vec![values])?;
-        let expression = self
-            .physical_expr
-            .downcast_ref::<DynamicFilterPhysicalExpr>()
-            .and_then(|dynamic| dynamic.current().ok())
-            .unwrap_or_else(|| Arc::clone(&self.physical_expr));
-        let filter = evaluate_selection_bytes(&expression, &batch).map_err(|error| {
-            ArrowError::ComputeError(format!(
-                "Error evaluating primitive predicate values: {error:?}"
-            ))
-        })?;
-        timer.done();
-        Ok(filter)
-    }
-}
-
-fn evaluate_selection_bytes(
-    expression: &Arc<dyn PhysicalExpr>,
-    batch: &RecordBatch,
-) -> Result<Vec<u8>> {
-    if let Some(in_list) = expression.downcast_ref::<InListExpr>()
-        && in_list
-            .expr()
-            .downcast_ref::<Column>()
-            .is_some_and(|column| column.index() == 0)
-        && let Some(values) = in_list.evaluate_values(batch.column(0).as_ref())?
-    {
-        return Ok(values);
-    }
-
-    if let Some(binary) = expression.downcast_ref::<BinaryExpr>()
-        && binary.op() == &Operator::And
-    {
-        let left = evaluate_selection_bytes(binary.left(), batch)?;
-        let right = evaluate_selection_bytes(binary.right(), batch)?;
-        return Ok(left
-            .into_iter()
-            .zip(right)
-            .map(|(left, right)| left & right)
-            .collect());
-    }
-
-    let filter = expression.evaluate(batch)?.into_array(batch.num_rows())?;
-    Ok(as_boolean_array(&filter)?
-        .iter()
-        .map(|value| u8::from(value.unwrap_or(false)))
-        .collect())
 }
 
 fn is_exact_value_list_dynamic_filter(
@@ -239,6 +189,7 @@ impl DatafusionArrowPredicate {
         let primitive_dictionary_predicate = physical_expr
             .downcast_ref::<DynamicFilterPhysicalExpr>()
             .filter(|_| candidate.read_plan.projected_schema.fields().len() == 1)
+            .filter(|_| candidate.read_plan.primitive_dictionary_encoded)
             .filter(|_| {
                 matches!(
                     candidate.read_plan.projected_schema.field(0).data_type(),
@@ -351,6 +302,12 @@ pub(crate) struct ParquetReadPlan {
     /// The projected Arrow schema containing only the columns/fields required
     /// Struct types are pruned to include only the accessed sub-fields
     pub projected_schema: SchemaRef,
+    /// Whether every row group encodes the single projected leaf with dictionary IDs.
+    ///
+    /// The primitive dictionary predicate reader has a plain-page compatibility path, but
+    /// selecting it for a column with no dictionary pages adds an avoidable decode and Boolean
+    /// packing layer. Keep ordinary Arrow predicate evaluation for those columns.
+    primitive_dictionary_encoded: bool,
 }
 
 /// Helper to build a `FilterCandidate`.
@@ -778,6 +735,9 @@ pub(crate) fn build_parquet_read_plan(
     leaf_indices.dedup();
 
     let required_bytes = size_of_columns(&leaf_indices, metadata)?;
+    let primitive_dictionary_encoded =
+        is_dictionary_encoded_single_leaf(&leaf_indices, metadata);
+
     let projection_mask =
         ProjectionMask::leaves(schema_descr, leaf_indices.iter().copied());
 
@@ -791,6 +751,7 @@ pub(crate) fn build_parquet_read_plan(
         ParquetReadPlan {
             projection_mask,
             projected_schema,
+            primitive_dictionary_encoded,
         },
         required_bytes,
     )))
@@ -833,6 +794,7 @@ pub(crate) fn build_projection_read_plan(
         return ParquetReadPlan {
             projection_mask,
             projected_schema,
+            primitive_dictionary_encoded: false,
         };
     }
 
@@ -864,6 +826,7 @@ pub(crate) fn build_projection_read_plan(
         return ParquetReadPlan {
             projection_mask,
             projected_schema,
+            primitive_dictionary_encoded: false,
         };
     }
 
@@ -896,6 +859,7 @@ pub(crate) fn build_projection_read_plan(
         return ParquetReadPlan {
             projection_mask,
             projected_schema,
+            primitive_dictionary_encoded: false,
         };
     }
 
@@ -921,7 +885,26 @@ pub(crate) fn build_projection_read_plan(
     ParquetReadPlan {
         projection_mask,
         projected_schema,
+        primitive_dictionary_encoded: false,
     }
+}
+
+fn is_dictionary_encoded_single_leaf(
+    leaf_indices: &[usize],
+    metadata: &ParquetMetaData,
+) -> bool {
+    let [leaf_index] = leaf_indices else {
+        return false;
+    };
+    !metadata.row_groups().is_empty()
+        && metadata.row_groups().iter().all(|row_group| {
+            row_group.column(*leaf_index).encodings().any(|encoding| {
+                matches!(
+                    encoding,
+                    Encoding::PLAIN_DICTIONARY | Encoding::RLE_DICTIONARY
+                )
+            })
+        })
 }
 
 fn leaf_indices_for_roots<I>(
@@ -1454,6 +1437,7 @@ mod test {
     use parquet::arrow::ArrowWriter;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use parquet::arrow::parquet_to_arrow_schema;
+    use parquet::file::properties::WriterProperties;
     use parquet::file::reader::{FileReader, SerializedFileReader};
     use tempfile::NamedTempFile;
 
@@ -1519,28 +1503,36 @@ mod test {
     }
 
     #[test]
-    fn primitive_predicate_values_preserve_conjuncts() {
+    fn primitive_dictionary_predicate_requires_dictionary_encoded_column() {
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
-        let expression = col("a")
-            .in_list(
-                vec![
-                    Expr::Literal(ScalarValue::Int32(Some(1)), None),
-                    Expr::Literal(ScalarValue::Int32(Some(3)), None),
-                ],
-                false,
-            )
-            .and(col("a").gt_eq(Expr::Literal(ScalarValue::Int32(Some(2)), None)));
-        let expression = logical2physical(&expression, &schema);
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
-            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+            vec![Arc::new(Int32Array::from_iter_values(0..1024))],
         )
         .expect("record batch");
 
-        assert_eq!(
-            evaluate_selection_bytes(&expression, &batch).expect("selection"),
-            vec![0, 0, 1]
-        );
+        for dictionary_enabled in [false, true] {
+            let file = NamedTempFile::new().expect("temp file");
+            let properties = WriterProperties::builder()
+                .set_dictionary_enabled(dictionary_enabled)
+                .build();
+            let mut writer = ArrowWriter::try_new(
+                file.reopen().expect("reopen file"),
+                Arc::clone(&schema),
+                Some(properties),
+            )
+            .expect("writer");
+            writer.write(&batch).expect("write batch");
+            writer.close().expect("close writer");
+
+            let reader_file = file.reopen().expect("reopen file");
+            let reader =
+                ParquetRecordBatchReaderBuilder::try_new(reader_file).expect("reader");
+            assert_eq!(
+                is_dictionary_encoded_single_leaf(&[0], reader.metadata()),
+                dictionary_enabled
+            );
+        }
     }
 
     // List predicates used by the decoder should be accepted for pushdown

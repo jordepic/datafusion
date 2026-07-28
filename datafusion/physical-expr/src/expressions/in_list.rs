@@ -246,15 +246,6 @@ impl InListExpr {
 
         Ok(Self::new(expr, list, negated, static_filter))
     }
-
-    /// Evaluate already-decoded primitive values to one selection byte per
-    /// value when this expression has a precomputed membership filter.
-    pub fn evaluate_values(&self, values: &dyn Array) -> Result<Option<Vec<u8>>> {
-        self.static_filter
-            .as_ref()
-            .map(|filter| filter.contains_values(values, self.negated))
-            .transpose()
-    }
 }
 impl std::fmt::Display for InListExpr {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
