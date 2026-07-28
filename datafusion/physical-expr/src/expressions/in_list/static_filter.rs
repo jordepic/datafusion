@@ -68,4 +68,17 @@ pub(super) trait StaticFilter {
     /// haystack. `v` may be dictionary-encoded, in which case the
     /// implementation unwraps the dictionary and operates on its values.
     fn contains(&self, v: &dyn Array, negated: bool) -> Result<BooleanArray>;
+
+    /// Checks primitive values and returns one selection byte per value.
+    ///
+    /// Parquet's primitive predicate reader consumes this representation
+    /// directly. Implementations with a scalar membership test can override
+    /// this to avoid constructing and unpacking a bit-packed BooleanArray.
+    fn contains_values(&self, v: &dyn Array, negated: bool) -> Result<Vec<u8>> {
+        Ok(self
+            .contains(v, negated)?
+            .iter()
+            .map(|value| u8::from(value.unwrap_or(false)))
+            .collect())
+    }
 }
