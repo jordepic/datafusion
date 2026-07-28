@@ -1213,17 +1213,24 @@ pub fn build_row_filter(
     // Split into conjuncts:
     // `a = 1 AND b = 2 AND c = 3` -> [`a = 1`, `b = 2`, `c = 3`]
     let predicates = split_conjunction(expr).into_iter().filter(|expr| {
-        !predicate_matches_all_row_groups(
-            Arc::clone(expr),
-            file_schema,
-            metadata.file_metadata().schema_descr(),
-            metadata.row_groups(),
-        ) && !dynamic_predicate_matches_all_non_null_row_groups(
-            expr,
-            file_schema,
-            metadata.file_metadata().schema_descr(),
-            metadata.row_groups(),
-        )
+        // An in-progress dynamic filter may still contain its match-all
+        // placeholder. Keep it in the decoder so a later update can begin
+        // filtering rows without rebuilding the Parquet reader.
+        let dynamic_filter_in_progress = expr
+            .downcast_ref::<DynamicFilterPhysicalExpr>()
+            .is_some_and(|dynamic| !dynamic.inner().is_complete);
+        dynamic_filter_in_progress
+            || (!predicate_matches_all_row_groups(
+                Arc::clone(expr),
+                file_schema,
+                metadata.file_metadata().schema_descr(),
+                metadata.row_groups(),
+            ) && !dynamic_predicate_matches_all_non_null_row_groups(
+                expr,
+                file_schema,
+                metadata.file_metadata().schema_descr(),
+                metadata.row_groups(),
+            ))
     });
 
     // Determine which conjuncts can be evaluated as ArrowPredicates, if any
@@ -1614,6 +1621,54 @@ mod test {
             .map(|batch| batch.expect("batch").num_rows())
             .sum();
         assert_eq!(rows, 3);
+    }
+
+    #[test]
+    fn retains_in_progress_dynamic_filter_in_parquet_decoder() {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5]))],
+        )
+        .expect("record batch");
+
+        let file = NamedTempFile::new().expect("temp file");
+        let mut writer =
+            ArrowWriter::try_new(file.reopen().unwrap(), schema, None).expect("writer");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close writer");
+
+        let reader_file = file.reopen().expect("reopen file");
+        let parquet_reader_builder =
+            ParquetRecordBatchReaderBuilder::try_new(reader_file).expect("reader");
+        let metadata = parquet_reader_builder.metadata().clone();
+        let file_schema = parquet_reader_builder.schema().clone();
+        let column = Arc::new(PhysicalColumn::new("a", 0)) as Arc<dyn PhysicalExpr>;
+        let dynamic = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![Arc::clone(&column)],
+            lit(true),
+        ));
+        let predicate = Arc::clone(&dynamic) as Arc<dyn PhysicalExpr>;
+        let metrics = ExecutionPlanMetricsSet::new();
+        let file_metrics = ParquetFileMetrics::new(0, "dynamic-filter.parquet", &metrics);
+
+        let row_filter =
+            build_row_filter(&predicate, &file_schema, &metadata, false, &file_metrics)
+                .expect("building row filter")
+                .expect("in-progress dynamic filter must remain in the decoder");
+
+        let updated = col("a").gt(Expr::Literal(ScalarValue::Int32(Some(3)), None));
+        dynamic
+            .update(logical2physical(&updated, &file_schema))
+            .expect("updating dynamic filter");
+
+        let rows: usize = parquet_reader_builder
+            .with_row_filter(row_filter)
+            .build()
+            .expect("filtered reader")
+            .map(|batch| batch.expect("batch").num_rows())
+            .sum();
+        assert_eq!(rows, 2);
     }
 
     #[test]
